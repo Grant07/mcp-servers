@@ -14,6 +14,11 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { diffLines, createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
+
+// Promisify exec for cleaner async/await usage
+const execPromise = promisify(exec);
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -94,6 +99,34 @@ async function validatePath(requestedPath: string): Promise<string> {
   }
 }
 
+// Command execution validation
+function validateCommand(command: string): void {
+  // List of disallowed commands or command fragments
+  const dangerousCommands = [
+    'rm -rf /', 'sudo rm', 'chmod 777', 'dd if=/dev/random',
+    ':(){ :|:& };:', '> /dev/sda', '> /dev/null', 'mkfs',
+    'wget -O- | sh', 'curl | sh', '| bash', 'eval',
+    'sudo su', 'sudo su -'
+  ];
+
+  // Check for dangerous commands
+  if (dangerousCommands.some(cmd => command.includes(cmd))) {
+    throw new Error('Potentially dangerous command detected');
+  }
+
+  // Disallow certain commands entirely
+  const blacklistedCommands = [
+    'sudo', 'su', 'doas', 'chown', 'chmod', 'dd', 'mkfs', 'mkswap',
+    'mount', 'umount', 'pkexec', 'xdo', 'gksudo', 'shutdown', 'reboot',
+    'halt', 'poweroff', 'init', 'systemctl'
+  ];
+
+  const commandFirstWord = command.trim().split(/\s+/)[0];
+  if (blacklistedCommands.includes(commandFirstWord)) {
+    throw new Error(`Command '${commandFirstWord}' is not allowed for security reasons`);
+  }
+}
+
 // Schema definitions
 const ReadFileArgsSchema = z.object({
   path: z.string(),
@@ -144,6 +177,17 @@ const SearchFilesArgsSchema = z.object({
 
 const GetFileInfoArgsSchema = z.object({
   path: z.string(),
+});
+
+const ExecuteCommandArgsSchema = z.object({
+  command: z.string().describe('Command to execute in the shell'),
+  workingDirectory: z.string().optional().describe('Working directory where the command should be executed. Default is current directory')
+});
+
+const ExecuteInteractiveCommandArgsSchema = z.object({
+  command: z.string().describe('Command to execute interactively'),
+  workingDirectory: z.string().optional().describe('Working directory where the command should be executed. Default is current directory'),
+  input: z.string().optional().describe('Input to send to the command (like typing in response to a prompt)')
 });
 
 const ToolInputSchema = ToolSchema.shape.inputSchema;
@@ -330,6 +374,99 @@ async function applyFileEdits(
   return formattedDiff;
 }
 
+// Execute command utility
+async function executeCommand(command: string, workingDirectory?: string): Promise<string> {
+  validateCommand(command);
+  
+  let cwd = process.cwd();
+  if (workingDirectory) {
+    const validWd = await validatePath(workingDirectory);
+    cwd = validWd;
+  }
+
+  try {
+    const { stdout, stderr } = await execPromise(command, { cwd });
+    return (stdout + (stderr ? `\nSTDERR:\n${stderr}` : '')).trim();
+  } catch (error) {
+    if (error instanceof Error) {
+      // @ts-ignore - exec error has stderr and stdout
+      const stderr = error.stderr ? `\nSTDERR:\n${error.stderr}` : '';
+      // @ts-ignore - exec error has stderr and stdout
+      const stdout = error.stdout ? `\nSTDOUT:\n${error.stdout}` : '';
+      return `Command execution failed: ${error.message}${stdout}${stderr}`;
+    }
+    return `Command execution failed: ${String(error)}`;
+  }
+}
+
+// Execute interactive command utility
+async function executeInteractiveCommand(command: string, workingDirectory?: string, input?: string): Promise<string> {
+  validateCommand(command);
+  
+  return new Promise((resolve, reject) => {
+    let cwd = process.cwd();
+    if (workingDirectory) {
+      try {
+        // Note: This is synchronous validation which isn't ideal
+        // In a production environment, you'd want to validate this asynchronously
+        const stats = fs.statSync(workingDirectory);
+        if (!stats.isDirectory()) {
+          return reject(new Error(`Working directory is not a directory: ${workingDirectory}`));
+        }
+        cwd = workingDirectory;
+      } catch (error) {
+        return reject(new Error(`Invalid working directory: ${error}`));
+      }
+    }
+
+    // Split command into program and args
+    const parts = command.split(/\s+/);
+    const program = parts[0];
+    const args = parts.slice(1);
+
+    let output = '';
+    let errorOutput = '';
+
+    const childProcess = spawn(program, args, {
+      cwd,
+      shell: true
+    });
+
+    childProcess.stdout.on('data', (data) => {
+      const text = data.toString();
+      output += text;
+    });
+
+    childProcess.stderr.on('data', (data) => {
+      const text = data.toString();
+      errorOutput += text;
+    });
+
+    if (input) {
+      childProcess.stdin.write(input + '\n');
+      childProcess.stdin.end();
+    }
+
+    childProcess.on('close', (code) => {
+      if (code === 0) {
+        resolve(output + (errorOutput ? `\nSTDERR:\n${errorOutput}` : ''));
+      } else {
+        resolve(`Command exited with code ${code}.\nSTDOUT:\n${output}\nSTDERR:\n${errorOutput}`);
+      }
+    });
+
+    childProcess.on('error', (error) => {
+      reject(new Error(`Failed to start command: ${error.message}`));
+    });
+
+    // Set a timeout to prevent hanging processes
+    setTimeout(() => {
+      childProcess.kill();
+      reject(new Error('Command execution timed out after 30 seconds'));
+    }, 30000);
+  });
+}
+
 // Tool handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -434,6 +571,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
           required: [],
         },
+      },
+      {
+        name: "execute_command",
+        description:
+          "Execute a shell command and return its output. Commands are validated for safety " +
+          "and certain potentially dangerous operations are blocked. You can specify a working " +
+          "directory for the command execution that must be within allowed directories. " +
+          "Both stdout and stderr will be returned.",
+        inputSchema: zodToJsonSchema(ExecuteCommandArgsSchema) as ToolInput,
+      },
+      {
+        name: "execute_interactive_command",
+        description:
+          "Execute an interactive shell command that may require input. Commands are validated " +
+          "for safety and certain potentially dangerous operations are blocked. You can provide " +
+          "input to the command and specify a working directory that must be within allowed directories. " +
+          "This is useful for commands that prompt for user input. Both stdout and stderr will be returned.",
+        inputSchema: zodToJsonSchema(ExecuteInteractiveCommandArgsSchema) as ToolInput,
       },
     ],
   };
@@ -618,6 +773,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: `Allowed directories:\n${allowedDirectories.join('\n')}`
           }],
+        };
+      }
+
+      case "execute_command": {
+        const parsed = ExecuteCommandArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for execute_command: ${parsed.error}`);
+        }
+        
+        const result = await executeCommand(
+          parsed.data.command,
+          parsed.data.workingDirectory
+        );
+        
+        return {
+          content: [{ type: "text", text: result }],
+        };
+      }
+
+      case "execute_interactive_command": {
+        const parsed = ExecuteInteractiveCommandArgsSchema.safeParse(args);
+        if (!parsed.success) {
+          throw new Error(`Invalid arguments for execute_interactive_command: ${parsed.error}`);
+        }
+        
+        // Validate working directory if provided
+        let workingDir = undefined;
+        if (parsed.data.workingDirectory) {
+          workingDir = await validatePath(parsed.data.workingDirectory);
+        }
+        
+        const result = await executeInteractiveCommand(
+          parsed.data.command,
+          workingDir,
+          parsed.data.input
+        );
+        
+        return {
+          content: [{ type: "text", text: result }],
         };
       }
 
